@@ -29,9 +29,7 @@ Mpris::Mpris(const std::string& id, const Json::Value& config)
       tooltip_len_limits_(false),
       // this character is used in Gnome so it's fine to use it here
       ellipsis_("\u2026"),
-      player_("playerctld"),
-      manager(),
-      player() {
+      manager() {
   if (config_["format-playing"].isString()) {
     format_playing_ = config_["format-playing"].asString();
   }
@@ -87,8 +85,9 @@ Mpris::Mpris(const std::string& id, const Json::Value& config)
   if (config_["truncate-hours"].isBool()) {
     truncate_hours_ = config["truncate-hours"].asBool();
   }
+  std::string default_player = "";
   if (config_["player"].isString()) {
-    player_ = config_["player"].asString();
+    default_player = config_["player"].asString();
   }
   if (config_["ignored-players"].isArray()) {
     for (auto it = config_["ignored-players"].begin(); it != config_["ignored-players"].end();
@@ -108,38 +107,39 @@ Mpris::Mpris(const std::string& id, const Json::Value& config)
   g_object_connect(manager, "signal::name-appeared", G_CALLBACK(onPlayerNameAppeared), this, NULL);
   g_object_connect(manager, "signal::name-vanished", G_CALLBACK(onPlayerNameVanished), this, NULL);
 
-  if (player_ == "playerctld") {
+  GList* players = playerctl_list_players(&error);
+  if (error) {
+    auto e = fmt::format("unable to list players: {}", error->message);
+    g_error_free(error);
+    throw std::runtime_error(e);
+  }
+  for (auto p = players; p != NULL; p = p->next) {
+    auto pn = static_cast<PlayerctlPlayerName*>(p->data);
+    if (strcmp(pn->name, default_player.c_str()) == 0) {
+      auto player = playerctl_player_new_from_name(pn, &error);
+      if (player)
+        this->players.insert_or_assign(default_player, player);
+    }
+  }
+
+  if (default_player == "playerctld" && this->players.find("playerctld") != this->players.end()) {
     // use playerctld proxy
     PlayerctlPlayerName name = {
-        .instance = (gchar*)player_.c_str(),
+        .instance = (gchar*)default_player.c_str(),
         .source = PLAYERCTL_SOURCE_DBUS_SESSION,
     };
-    player = playerctl_player_new_from_name(&name, &error);
-
-  } else {
-    GList* players = playerctl_list_players(&error);
-    if (error) {
-      auto e = fmt::format("unable to list players: {}", error->message);
-      g_error_free(error);
-      throw std::runtime_error(e);
-    }
-
-    for (auto p = players; p != NULL; p = p->next) {
-      auto pn = static_cast<PlayerctlPlayerName*>(p->data);
-      if (strcmp(pn->name, player_.c_str()) == 0) {
-        player = playerctl_player_new_from_name(pn, &error);
-        break;
-      }
-    }
+    auto player = playerctl_player_new_from_name(&name, &error);
+    if (player)
+      this->players.insert_or_assign(default_player, player);
   }
 
   if (error) {
     throw std::runtime_error(
-        fmt::format("unable to connect to player {}: {}", player_, error->message));
+        fmt::format("unable to connect to player {}: {}", default_player, error->message));
   }
 
-  if (player) {
-    g_object_connect(player, "signal::play", G_CALLBACK(onPlayerPlay), this, "signal::pause",
+  for (auto &player : this->players) {
+    g_object_connect(player.second, "signal::play", G_CALLBACK(onPlayerPlay), this, "signal::pause",
                      G_CALLBACK(onPlayerPause), this, "signal::stop", G_CALLBACK(onPlayerStop),
                      this, "signal::stop", G_CALLBACK(onPlayerStop), this, "signal::metadata",
                      G_CALLBACK(onPlayerMetadata), this, NULL);
@@ -159,7 +159,9 @@ Mpris::Mpris(const std::string& id, const Json::Value& config)
 
 Mpris::~Mpris() {
   if (manager != NULL) g_object_unref(manager);
-  if (player != NULL) g_object_unref(player);
+  for (auto &player : players) {
+    g_object_unref(player.second);
+  }
 }
 
 auto Mpris::getIconFromJson(const Json::Value& icons, const std::string& key) -> std::string {
@@ -355,13 +357,12 @@ auto Mpris::onPlayerNameAppeared(PlayerctlPlayerManager* manager, PlayerctlPlaye
 
   spdlog::debug("mpris: name-appeared callback: {}", player_name->name);
 
-  if (std::string(player_name->name) != mpris->player_) {
-    return;
-  }
-
   GError* error = nullptr;
-  mpris->player = playerctl_player_new_from_name(player_name, &error);
-  g_object_connect(mpris->player, "signal::play", G_CALLBACK(onPlayerPlay), mpris, "signal::pause",
+  auto player = playerctl_player_new_from_name(player_name, &error);
+  if (!error && player) {
+    mpris->players.insert_or_assign(player_name->name, player);
+  }
+  g_object_connect(player, "signal::play", G_CALLBACK(onPlayerPlay), mpris, "signal::pause",
                    G_CALLBACK(onPlayerPause), mpris, "signal::stop", G_CALLBACK(onPlayerStop),
                    mpris, "signal::stop", G_CALLBACK(onPlayerStop), mpris, "signal::metadata",
                    G_CALLBACK(onPlayerMetadata), mpris, NULL);
@@ -376,9 +377,11 @@ auto Mpris::onPlayerNameVanished(PlayerctlPlayerManager* manager, PlayerctlPlaye
 
   spdlog::debug("mpris: player-vanished callback: {}", player_name->name);
 
-  if (std::string(player_name->name) == mpris->player_) {
-    mpris->player = nullptr;
-    mpris->dp.emit();
+  auto it = mpris->players.find(player_name->name);
+  if (it != mpris->players.end()) {
+    auto ptr = it->second;
+    mpris->players.erase(it);
+    g_object_unref(ptr);
   }
 }
 
@@ -421,7 +424,7 @@ auto Mpris::onPlayerMetadata(PlayerctlPlayer* player, GVariant* metadata, gpoint
   mpris->dp.emit();
 }
 
-auto Mpris::getPlayerInfo() -> std::optional<PlayerInfo> {
+auto Mpris::getPlayerInfo(PlayerctlPlayer *player) -> std::optional<PlayerInfo> {
   if (!player) {
     return std::nullopt;
   }

@@ -43,7 +43,7 @@ class Mpris : public ALabel {
     std::optional<std::string> position;  // same format
   };
 
-  auto getPlayerInfo() -> std::optional<PlayerInfo>;
+  auto getPlayerInfo(PlayerctlPlayer *player) -> std::optional<PlayerInfo>;
   auto getIconFromJson(const Json::Value&, const std::string&) -> std::string;
   auto getArtistStr(const PlayerInfo&, bool) -> std::string;
   auto getAlbumStr(const PlayerInfo&, bool) -> std::string;
@@ -71,11 +71,11 @@ class Mpris : public ALabel {
   bool tooltip_len_limits_;
   std::string ellipsis_;
 
-  std::string player_;
+  // std::string player_;
   std::vector<std::string> ignored_players_;
 
   PlayerctlPlayerManager* manager;
-  PlayerctlPlayer* player;
+  std::map<std::string, PlayerctlPlayer*> players;
   std::string lastStatus;
   std::string lastPlayer;
 
